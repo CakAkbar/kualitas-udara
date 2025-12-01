@@ -594,7 +594,7 @@ with col_map:
         st.error("❌ Gagal memuat file GeoJSON 'filtered.json'.")
 
 with col_table:
-    st.markdown("### 📋 Data Real-time")
+    st.markdown("### 📋 rata rata 24 - 48 jam")
     
     def color_aqi(val):
         if val <= 50: color = '#22c55e'
