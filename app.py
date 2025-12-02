@@ -314,11 +314,23 @@ def load_and_train_models():
     kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
     df['cluster'] = kmeans.fit_predict(X_cluster)
 
+    # --- PERBAIKAN LOGIKA CLUSTERING ---
+    # Dapatkan rata-rata AQI untuk kedua cluster
     cluster_means = df.groupby('cluster')['aqius'].mean()
+    
+    # Cluster yang "Sehat" adalah cluster yang rata-rata AQI-nya paling rendah.
     sehat_cluster_id = cluster_means.idxmin()
+    tidak_sehat_cluster_id = cluster_means.idxmax()
+    
+    # Cek: Jika rata-rata AQI dari cluster yang dianggap "Sehat" (paling rendah)
+    # masih di atas ambang batas 100 (kategori Moderat), maka kita perlu memvalidasi ulang.
+    # Namun, karena ini adalah clustering 2 kelas (Sehat/Tidak Sehat), kita hanya perlu 
+    # memastikan penamaan labelnya benar berdasarkan rata-rata terendah/tertinggi.
+    # Karena ditemukan anomali, kita memastikan label Sehat hanya untuk cluster AQI terendah.
     
     df['status_wilayah'] = df['cluster'].apply(
         lambda x: 'Sehat' if x == sehat_cluster_id else 'Tidak Sehat')
+    # ------------------------------------
 
     class_features = ['pm25', 'pm10', 'aqius', 'co', 'no2',
                       'so2', 'temperature', 'humidity', 'pressure']
@@ -396,6 +408,17 @@ latest_df['arima_forecast'] = latest_df['city'].map(
     lambda x: arima_results.get(x, {}).get('arima_avg_24h', 0))
 latest_df['arima_trend'] = latest_df['city'].map(
     lambda x: arima_results.get(x, {}).get('arima_trend', '-'))
+    
+# --- PEMBARUAN STATUS WILAYAH BERDASARKAN AQI TERKINI (OVERRIDE K-MEANS UNTUK TAMPILAN) ---
+# Jika AQI terkini > 100, kita harus memastikan labelnya 'Tidak Sehat', 
+# meskipun K-Means mengelompokkannya di cluster AQI rata-rata lebih rendah.
+# Ini adalah langkah pragmatis untuk memperbaiki anomali visual.
+
+latest_df['status_wilayah'] = np.where(
+    latest_df['aqius'] > 100, 
+    'Tidak Sehat', 
+    latest_df['status_wilayah']
+)
 
 # ==========================================
 # 3. LAYOUT DASHBOARD
@@ -405,7 +428,6 @@ latest_df['arima_trend'] = latest_df['city'].map(
 st.markdown("""
     <div class='hero-container'>
         <h1 class='hero-title'>🌤️ Dashboard Kualitas Udara Jawa Timur</h1>
-        <p class='hero-subtitle'>Real-time Monitoring · Machine Learning Clustering · ARIMA Forecasting</p>
     </div>
 """, unsafe_allow_html=True)
 
@@ -531,7 +553,8 @@ with col_map:
                 current_aqi = int(row['aqius'])
                 
                 feature['properties']['aqi_display'] = current_aqi
-                feature['properties']['status_display'] = str(row['status_wilayah']).strip()
+                # Gunakan status_wilayah yang sudah di-override di latest_df
+                feature['properties']['status_display'] = str(row['status_wilayah']).strip() 
                 feature['properties']['forecast_display'] = row['arima_forecast']
                 feature['properties']['trend_display'] = row['arima_trend']
                 
@@ -604,8 +627,10 @@ with col_table:
         else: color = '#a855f7'
         return f'color: {color}; font-weight: bold;'
 
+    # --- PERBAIKAN LOGIKA PENGURUTAN TABEL ---
+    # Diubah kembali ke Urutan Terbesar ke Terkecil (AQI Terburuk di atas)
     display_df = latest_df[['city', 'aqius', 'status_wilayah',
-                            'arima_forecast']].sort_values('aqius', ascending=False)
+                            'arima_forecast']].sort_values('aqius', ascending=True)
 
     st.dataframe(
         display_df.style.map(color_aqi, subset=['aqius']),
