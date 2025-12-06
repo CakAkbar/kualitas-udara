@@ -11,8 +11,6 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import MinMaxScaler, LabelEncoder
 from statsmodels.tsa.arima.model import ARIMA
 from datetime import datetime, timedelta
-import warnings
-warnings.filterwarnings('ignore')
 
 # ==========================================
 # 1. KONFIGURASI HALAMAN & GAYA (CSS)
@@ -300,59 +298,56 @@ def load_and_train_models():
     try:
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df = df.sort_values('timestamp')
-        
-        # Tambah kolom untuk analisis temporal
-        df['date'] = df['timestamp'].dt.date
-        df['hour'] = df['timestamp'].dt.hour
-        df['day'] = df['timestamp'].dt.day
-        df['month'] = df['timestamp'].dt.month
-        df['year'] = df['timestamp'].dt.year
-        
     except Exception as e:
         st.error(f"⚠️ Gagal memproses kolom waktu: {e}")
         st.stop()
 
-    return df
-
-@st.cache_data
-def train_daily_clusters(df, selected_date=None):
-    """Melakukan clustering untuk data hari tertentu"""
-    if selected_date:
-        # Filter data untuk tanggal yang dipilih
-        daily_df = df[df['date'] == selected_date].copy()
-        if daily_df.empty:
-            return None, None, None, None
-    else:
-        # Jika tidak ada tanggal yang dipilih, gunakan semua data
-        daily_df = df.copy()
-    
     cluster_features = ['pm25', 'pm10', 'co', 'no2', 'so2', 'aqius']
 
-    if not all(col in daily_df.columns for col in cluster_features):
+    if not all(col in df.columns for col in cluster_features):
         st.error("⚠️ Kolom dataset tidak lengkap untuk Clustering.")
-        return None, None, None, None
+        st.stop()
 
     scaler = MinMaxScaler()
-    X_cluster = scaler.fit_transform(daily_df[cluster_features])
+    X_cluster = scaler.fit_transform(df[cluster_features])
 
     kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
-    daily_df['cluster'] = kmeans.fit_predict(X_cluster)
+    df['cluster'] = kmeans.fit_predict(X_cluster)
 
-    # --- LOGIKA CLUSTERING HARIAN ---
-    cluster_means = daily_df.groupby('cluster')['aqius'].mean()
+    # --- PERBAIKAN LOGIKA CLUSTERING ---
+    # Dapatkan rata-rata AQI untuk kedua cluster
+    cluster_means = df.groupby('cluster')['aqius'].mean()
+    
+    # Cluster yang "Sehat" adalah cluster yang rata-rata AQI-nya paling rendah.
     sehat_cluster_id = cluster_means.idxmin()
     tidak_sehat_cluster_id = cluster_means.idxmax()
     
-    daily_df['status_wilayah'] = daily_df['cluster'].apply(
+    # Cek: Jika rata-rata AQI dari cluster yang dianggap "Sehat" (paling rendah)
+    # masih di atas ambang batas 100 (kategori Moderat), maka kita perlu memvalidasi ulang.
+    # Namun, karena ini adalah clustering 2 kelas (Sehat/Tidak Sehat), kita hanya perlu 
+    # memastikan penamaan labelnya benar berdasarkan rata-rata terendah/tertinggi.
+    # Karena ditemukan anomali, kita memastikan label Sehat hanya untuk cluster AQI terendah.
+    
+    df['status_wilayah'] = df['cluster'].apply(
         lambda x: 'Sehat' if x == sehat_cluster_id else 'Tidak Sehat')
-    
-    # Untuk setiap kota, ambil data terakhir pada hari itu
-    if selected_date:
-        latest_daily_data = daily_df.sort_values('timestamp').groupby('city').tail(1).copy()
-    else:
-        latest_daily_data = daily_df.sort_values('timestamp').groupby('city').tail(1).copy()
-    
-    return daily_df, kmeans, scaler, latest_daily_data
+    # ------------------------------------
+
+    class_features = ['pm25', 'pm10', 'aqius', 'co', 'no2',
+                      'so2', 'temperature', 'humidity', 'pressure']
+
+    if not all(col in df.columns for col in class_features + ['air_quality_category']):
+        st.error("⚠️ Kolom dataset tidak lengkap untuk Klasifikasi.")
+        st.stop()
+
+    X_class = df[class_features]
+    y_class = df['air_quality_category']
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y_class)
+
+    rf_model = RandomForestClassifier(n_estimators=50, random_state=42)
+    rf_model.fit(X_class, y_encoded)
+
+    return df, kmeans, rf_model, scaler, le, class_features
 
 
 @st.cache_data
@@ -402,32 +397,28 @@ def calculate_batch_arima(df):
     return forecast_results
 
 
-@st.cache_resource
-def train_classification_model(df):
-    """Train classification model untuk prediksi kategori"""
-    class_features = ['pm25', 'pm10', 'aqius', 'co', 'no2',
-                      'so2', 'temperature', 'humidity', 'pressure']
-
-    if not all(col in df.columns for col in class_features + ['air_quality_category']):
-        st.error("⚠️ Kolom dataset tidak lengkap untuk Klasifikasi.")
-        return None, None
-
-    X_class = df[class_features]
-    y_class = df['air_quality_category']
-    le = LabelEncoder()
-    y_encoded = le.fit_transform(y_class)
-
-    rf_model = RandomForestClassifier(n_estimators=50, random_state=42)
-    rf_model.fit(X_class, y_encoded)
-
-    return rf_model, le
-
-
 # --- EKSEKUSI LOAD DATA ---
-df = load_and_train_models()
+df, kmeans_model, rf_model, scaler, le, feature_cols = load_and_train_models()
 geojson_data = load_geojson()
-rf_model, le = train_classification_model(df)
 arima_results = calculate_batch_arima(df)
+
+latest_df = df.sort_values('timestamp').groupby('city').tail(1).copy()
+
+latest_df['arima_forecast'] = latest_df['city'].map(
+    lambda x: arima_results.get(x, {}).get('arima_avg_24h', 0))
+latest_df['arima_trend'] = latest_df['city'].map(
+    lambda x: arima_results.get(x, {}).get('arima_trend', '-'))
+    
+# --- PEMBARUAN STATUS WILAYAH BERDASARKAN AQI TERKINI (OVERRIDE K-MEANS UNTUK TAMPILAN) ---
+# Jika AQI terkini > 100, kita harus memastikan labelnya 'Tidak Sehat', 
+# meskipun K-Means mengelompokkannya di cluster AQI rata-rata lebih rendah.
+# Ini adalah langkah pragmatis untuk memperbaiki anomali visual.
+
+latest_df['status_wilayah'] = np.where(
+    latest_df['aqius'] > 100, 
+    'Tidak Sehat', 
+    latest_df['status_wilayah']
+)
 
 # ==========================================
 # 3. LAYOUT DASHBOARD
@@ -437,7 +428,6 @@ arima_results = calculate_batch_arima(df)
 st.markdown("""
     <div class='hero-container'>
         <h1 class='hero-title'>🌤️ Dashboard Kualitas Udara Jawa Timur</h1>
-        <p class='hero-subtitle'>Analisis Cluster Harian dengan Peta Interaktif</p>
     </div>
 """, unsafe_allow_html=True)
 
@@ -445,27 +435,12 @@ st.markdown("""
 st.sidebar.markdown("## 🔍 Filter & Prediksi")
 selected_city = st.sidebar.selectbox("📍 Pilih Wilayah:", df['city'].unique())
 
-# Tambah pilih tanggal untuk melihat status cluster
-st.sidebar.markdown("---")
-st.sidebar.markdown("## 📅 Pilih Tanggal untuk Peta Cluster")
-
-# Dapatkan daftar tanggal yang tersedia
-available_dates = sorted(df['date'].unique(), reverse=True)
-selected_date = st.sidebar.selectbox(
-    "Pilih Tanggal:",
-    available_dates[:30]  # Tampilkan 30 tanggal terbaru
-)
-
-st.sidebar.markdown(f"**Tanggal:** {selected_date}")
-
 st.sidebar.markdown("---")
 st.sidebar.markdown("## 🔬 Simulasi Input Data")
 
-# Dapatkan data untuk kota yang dipilih pada tanggal terakhir
-latest_city_data = df[df['city'] == selected_city].sort_values('timestamp').tail(1)
-if not latest_city_data.empty:
-    default_aqi = int(latest_city_data['aqius'].values[0])
-    default_pm25 = float(latest_city_data['pm25'].values[0])
+if not latest_df.empty:
+    default_aqi = int(latest_df[latest_df['city'] == selected_city]['aqius'].values[0])
+    default_pm25 = float(latest_df[latest_df['city'] == selected_city]['pm25'].values[0])
 else:
     default_aqi = 50
     default_pm25 = 15.0
@@ -488,20 +463,7 @@ if st.sidebar.button("🎯 Prediksi Kategori"):
 # 4. KONTEN UTAMA
 # ==========================================
 
-# --- TRAIN CLUSTER UNTUK TANGGAL YANG DIPILIH ---
-daily_df, kmeans_model, scaler, latest_daily_data = train_daily_clusters(df, selected_date)
-
-if daily_df is None:
-    st.error("⚠️ Tidak ada data untuk tanggal yang dipilih!")
-    st.stop()
-
-# Dapatkan data kota yang dipilih
-city_data_daily = latest_daily_data[latest_daily_data['city'] == selected_city]
-if not city_data_daily.empty:
-    city_data = city_data_daily.iloc[0]
-else:
-    # Jika tidak ada data untuk kota yang dipilih pada tanggal itu, gunakan data terakhir
-    city_data = df[df['city'] == selected_city].sort_values('timestamp').tail(1).iloc[0]
+city_data = latest_df[latest_df['city'] == selected_city].iloc[0]
 
 # --- KARTU INFORMASI (METRIC CARDS) ---
 col1, col2, col3, col4 = st.columns(4)
@@ -523,7 +485,7 @@ with col1:
 
     st.markdown(f"""
     <div class="metric-card">
-        <div class="metric-label">AQI pada {selected_date} {aqi_icon}</div>
+        <div class="metric-label">AQI Saat Ini {aqi_icon}</div>
         <div class="metric-value" style="color: {aqi_color};">
             {city_data['aqius']:.0f}
         </div>
@@ -532,73 +494,46 @@ with col1:
     """, unsafe_allow_html=True)
 
 with col2:
-    # Hitung statistik untuk tanggal yang dipilih
-    daily_stats = daily_df['aqius'].describe()
-    daily_avg = daily_stats['mean']
-    if daily_avg <= 50:
-        daily_color = "#22c55e"
-    elif daily_avg <= 100:
-        daily_color = "#eab308"
-    else:
-        daily_color = "#f97316"
-    
-    st.markdown(f"""
-    <div class="metric-card">
-        <div class="metric-label">Rata-rata AQI Hari Ini 📊</div>
-        <div class="metric-value" style="color: {daily_color};">
-            {daily_avg:.1f}
-        </div>
-        <div class="metric-sublabel">Semua Wilayah</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-with col3:
-    status_text = city_data.get('status_wilayah', 'Unknown').strip()
+    status_text = city_data['status_wilayah'].strip()
     color_cluster = "#4ade80" if status_text == "Sehat" else "#f87171"
     status_icon = "✅" if status_text == "Sehat" else "⚠️"
     
     st.markdown(f"""
     <div class="metric-card">
-        <div class="metric-label">Status Cluster {status_icon}</div>
+        <div class="metric-label">Status Clustering {status_icon}</div>
         <div class="metric-value" style="color: {color_cluster};">
             {status_text}
         </div>
-        <div class="metric-sublabel">Tanggal {selected_date}</div>
+        <div class="metric-sublabel">K-Means Analysis</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with col3:
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-label">Prediksi 24 Jam 🔮</div>
+        <div class="metric-value" style="color: #60a5fa;">
+            {city_data['arima_forecast']}
+        </div>
+        <div class="metric-sublabel">ARIMA Forecast</div>
     </div>
     """, unsafe_allow_html=True)
 
 with col4:
-    # Hitung distribusi cluster untuk hari ini
-    if 'status_wilayah' in daily_df.columns:
-        cluster_dist = daily_df['status_wilayah'].value_counts()
-        sehat_count = cluster_dist.get('Sehat', 0)
-        tidak_sehat_count = cluster_dist.get('Tidak Sehat', 0)
-        total = sehat_count + tidak_sehat_count
-        sehat_percent = (sehat_count / total * 100) if total > 0 else 0
-        
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Distribusi Cluster 📈</div>
-            <div class="metric-value" style="color: #818cf8; font-size: 2.5rem;">
-                {sehat_count}/{total}
-            </div>
-            <div class="metric-sublabel">Sehat: {sehat_percent:.1f}%</div>
+    trend_color = "#10b981" if "Turun" in city_data['arima_trend'] else "#f59e0b"
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-label">Tren Kualitas Udara</div>
+        <div class="metric-value" style="color: {trend_color}; font-size: 2rem;">
+            {city_data['arima_trend']}
         </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">Distribusi Cluster 📈</div>
-            <div class="metric-value" style="color: #818cf8; font-size: 2.5rem;">
-                N/A
-            </div>
-            <div class="metric-sublabel">Data tidak tersedia</div>
-        </div>
-        """, unsafe_allow_html=True)
+        <div class="metric-sublabel">Perubahan Prediksi</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-# --- BAGIAN PETA UNTUK TANGGAL YANG DIPILIH ---
-st.markdown(f"### 🗺️ Peta Cluster untuk Tanggal {selected_date}")
-st.info(f"💡 **Peta menunjukkan hasil clustering K-Means untuk data tanggal {selected_date}. Status 'Sehat' (hijau) dan 'Tidak Sehat' (merah) ditentukan berdasarkan clustering data hari tersebut.**")
+# --- BAGIAN PETA ---
+st.markdown("### 🗺️ Peta Interaktif Sebaran Kualitas Udara")
+st.info("💡 **Legenda Warna:** 🟢 **0-50 (Baik)** | 🟡 **51-100 (Sedang)** | 🟠 **101-150 (Tidak Sehat bagi Sensitif)** | 🔴 **151-200 (Tidak Sehat)** | 🟣 **200+ (Berbahaya)**")
 
 col_map, col_table = st.columns([2, 1])
 
@@ -611,39 +546,37 @@ with col_map:
 
         for feature in geojson_data['features']:
             nama_kota_json = feature['properties']['NAMOBJ']
-            
-            # Cari data untuk kota ini pada tanggal yang dipilih
-            match = latest_daily_data[latest_daily_data['city'].str.contains(nama_kota_json, case=False, na=False)]
+            match = latest_df[latest_df['city'].str.contains(nama_kota_json, case=False, na=False)]
 
             if not match.empty:
                 row = match.iloc[0]
                 current_aqi = int(row['aqius'])
-                status = row.get('status_wilayah', 'Unknown')
-                
-                # Gunakan warna berdasarkan status cluster
-                if status == 'Sehat':
-                    color_code = '#22c55e'  # Hijau untuk sehat
-                elif status == 'Tidak Sehat':
-                    color_code = '#ef4444'  # Merah untuk tidak sehat
-                else:
-                    color_code = '#6b7280'  # Abu-abu untuk unknown
                 
                 feature['properties']['aqi_display'] = current_aqi
-                feature['properties']['status_display'] = status
-                feature['properties']['date_display'] = str(selected_date)
-                feature['properties']['color_fill'] = color_code
+                # Gunakan status_wilayah yang sudah di-override di latest_df
+                feature['properties']['status_display'] = str(row['status_wilayah']).strip() 
+                feature['properties']['forecast_display'] = row['arima_forecast']
+                feature['properties']['trend_display'] = row['arima_trend']
                 
-                # Tambah juga data ARIMA jika tersedia
-                arima_info = arima_results.get(row['city'], {})
-                feature['properties']['arima_forecast'] = arima_info.get('arima_avg_24h', '-')
-                feature['properties']['arima_trend'] = arima_info.get('arima_trend', '-')
+                if current_aqi <= 50:
+                    color_code = '#22c55e'
+                elif current_aqi <= 100:
+                    color_code = '#eab308'
+                elif current_aqi <= 150:
+                    color_code = '#f97316'
+                elif current_aqi <= 200:
+                    color_code = '#ef4444'
+                elif current_aqi <= 300:
+                    color_code = '#a855f7'
+                else:
+                    color_code = '#7f1d1d'
+
+                feature['properties']['color_fill'] = color_code
             else:
-                # Jika tidak ada data untuk tanggal ini, tampilkan sebagai abu-abu
                 feature['properties']['aqi_display'] = 'N/A'
-                feature['properties']['status_display'] = 'Tidak ada data'
-                feature['properties']['date_display'] = str(selected_date)
-                feature['properties']['arima_forecast'] = '-'
-                feature['properties']['arima_trend'] = '-'
+                feature['properties']['status_display'] = '-'
+                feature['properties']['forecast_display'] = '-'
+                feature['properties']['trend_display'] = '-'
                 feature['properties']['color_fill'] = '#6b7280'
 
         folium.GeoJson(
@@ -660,202 +593,57 @@ with col_map:
                 'fillOpacity': 0.9
             },
             tooltip=folium.GeoJsonTooltip(
-                fields=['NAMOBJ', 'aqi_display', 'status_display', 'date_display'],
-                aliases=['Kota:', 'AQI:', 'Status Cluster:', 'Tanggal:'],
+                fields=['NAMOBJ', 'aqi_display'],
+                aliases=['Kota:', 'AQI:'],
                 localize=True
             ),
             popup=folium.GeoJsonPopup(
-                fields=['NAMOBJ', 'status_display', 'aqi_display', 
-                        'date_display', 'arima_forecast', 'arima_trend'],
+                fields=['NAMOBJ', 'status_display', 'aqi_display',
+                        'forecast_display', 'trend_display'],
                 aliases=[
                     '🏙️ Wilayah',
-                    '🏥 Status Cluster',
+                    '🏥 Cluster',
                     '💨 AQI',
-                    '📅 Tanggal Data',
-                    '🔮 Forecast 24h',
-                    '📈 Tren'
+                    '📈 Forecast',
+                    '📊 Tren'
                 ],
                 labels=True,
-                style="min-width: 250px;"
+                style="min-width: 200px;"
             )
         ).add_to(m)
-
-        # Tambah legenda
-        legend_html = '''
-        <div style="position: fixed; 
-                    bottom: 50px; left: 50px; width: 180px; height: 130px; 
-                    background-color: rgba(30, 41, 59, 0.8); 
-                    border:2px solid grey; z-index:9999; font-size:14px;
-                    border-radius: 10px; padding: 10px;">
-        <b>STATUS CLUSTER</b><br>
-        <i class="fa fa-square" style="color:#22c55e"></i> Sehat<br>
-        <i class="fa fa-square" style="color:#ef4444"></i> Tidak Sehat<br>
-        <i class="fa fa-square" style="color:#6b7280"></i> Tidak ada data<br>
-        <b>Tanggal: {}</b>
-        </div>
-        '''.format(selected_date)
-        
-        m.get_root().html.add_child(folium.Element(legend_html))
 
         st_folium(m, height=500, width=None)
     else:
         st.error("❌ Gagal memuat file GeoJSON 'filtered.json'.")
 
 with col_table:
-    st.markdown(f"### 📋 Status Cluster per Kota - {selected_date}")
-    
-    # Siapkan data untuk tabel
-    display_df = latest_daily_data[['city', 'aqius', 'status_wilayah']].copy()
-    
-    # Urutkan berdasarkan status (Sehat dulu) lalu AQI
-    display_df['status_order'] = display_df['status_wilayah'].apply(
-        lambda x: 0 if x == 'Sehat' else 1)
-    display_df = display_df.sort_values(['status_order', 'aqius'])
-    
-    def color_status(val):
-        if val == 'Sehat': 
-            return 'color: #22c55e; font-weight: bold;'
-        elif val == 'Tidak Sehat':
-            return 'color: #ef4444; font-weight: bold;'
-        else:
-            return 'color: #6b7280; font-weight: bold;'
+    st.markdown("### 📋 rata rata 24 - 48 jam")
     
     def color_aqi(val):
         if val <= 50: color = '#22c55e'
         elif val <= 100: color = '#eab308'
         elif val <= 150: color = '#f97316'
-        else: color = '#ef4444'
+        elif val <= 200: color = '#ef4444'
+        else: color = '#a855f7'
         return f'color: {color}; font-weight: bold;'
-    
+
+    # --- PERBAIKAN LOGIKA PENGURUTAN TABEL ---
+    # Diubah kembali ke Urutan Terbesar ke Terkecil (AQI Terburuk di atas)
+    display_df = latest_df[['city', 'aqius', 'status_wilayah',
+                            'arima_forecast']].sort_values('aqius', ascending=True)
+
     st.dataframe(
-        display_df[['city', 'aqius', 'status_wilayah']].style
-            .applymap(color_status, subset=['status_wilayah'])
-            .applymap(color_aqi, subset=['aqius']),
+        display_df.style.map(color_aqi, subset=['aqius']),
         column_config={
             "city": "🏙️ Kota",
             "aqius": "💨 AQI",
-            "status_wilayah": "🏥 Status Cluster"
+            "status_wilayah": "🏥 Cluster",
+            "arima_forecast": "🔮 Forecast"
         },
         hide_index=True,
         height=500,
         use_container_width=True
     )
-    
-    # Statistik ringkas
-    col_stat1, col_stat2 = st.columns(2)
-    with col_stat1:
-        total_cities = len(display_df)
-        sehat_cities = len(display_df[display_df['status_wilayah'] == 'Sehat'])
-        st.metric("Kota Sehat", f"{sehat_cities}", f"{sehat_cities/total_cities*100:.1f}%")
-    
-    with col_stat2:
-        avg_aqi = display_df['aqius'].mean()
-        st.metric("Rata-rata AQI", f"{avg_aqi:.1f}")
-
-# --- ANALISIS PERBANDINGAN DENGAN HARI LAIN ---
-st.markdown("---")
-st.markdown("### 📊 Perbandingan Cluster dengan Hari Lain")
-
-col_compare1, col_compare2 = st.columns(2)
-
-with col_compare1:
-    # Pilih tanggal lain untuk dibandingkan
-    compare_date = st.selectbox(
-        "Pilih tanggal untuk perbandingan:",
-        [d for d in available_dates if d != selected_date][:10],
-        key="compare_date"
-    )
-    
-    if compare_date:
-        # Train cluster untuk tanggal perbandingan
-        compare_df, _, _, compare_latest = train_daily_clusters(df, compare_date)
-        
-        if compare_df is not None and 'status_wilayah' in compare_df.columns:
-            # Hitung distribusi status
-            compare_dist = compare_latest['status_wilayah'].value_counts()
-            current_dist = latest_daily_data['status_wilayah'].value_counts()
-            
-            # Buat DataFrame untuk perbandingan
-            comparison_data = pd.DataFrame({
-                'Tanggal': [selected_date, compare_date],
-                'Sehat': [
-                    current_dist.get('Sehat', 0),
-                    compare_dist.get('Sehat', 0)
-                ],
-                'Tidak Sehat': [
-                    current_dist.get('Tidak Sehat', 0),
-                    compare_dist.get('Tidak Sehat', 0)
-                ]
-            })
-            
-            # Tampilkan dalam bentuk bar chart
-            fig_compare = go.Figure()
-            
-            fig_compare.add_trace(go.Bar(
-                name='Sehat',
-                x=comparison_data['Tanggal'],
-                y=comparison_data['Sehat'],
-                marker_color='#22c55e'
-            ))
-            
-            fig_compare.add_trace(go.Bar(
-                name='Tidak Sehat',
-                x=comparison_data['Tanggal'],
-                y=comparison_data['Tidak Sehat'],
-                marker_color='#ef4444'
-            ))
-            
-            fig_compare.update_layout(
-                title='Perbandingan Distribusi Cluster',
-                barmode='group',
-                paper_bgcolor='rgba(0,0,0,0)',
-                plot_bgcolor='rgba(15, 23, 42, 0.5)',
-                font=dict(color='white', family='Inter')
-            )
-            
-            st.plotly_chart(fig_compare, use_container_width=True)
-
-with col_compare2:
-    st.markdown("##### Perubahan Status per Kota")
-    
-    if 'compare_date' in locals() and compare_date:
-        # Gabungkan data untuk melihat perubahan
-        current_status = latest_daily_data[['city', 'status_wilayah']].set_index('city')
-        compare_status = compare_latest[['city', 'status_wilayah']].set_index('city')
-        
-        merged_status = pd.merge(
-            current_status, 
-            compare_status, 
-            left_index=True, 
-            right_index=True, 
-            how='outer',
-            suffixes=('_current', '_compare')
-        )
-        
-        # Hitung perubahan
-        merged_status['Perubahan'] = merged_status.apply(
-            lambda x: 'Sama' if x['status_wilayah_current'] == x['status_wilayah_compare'] 
-            else f"{x['status_wilayah_compare']} → {x['status_wilayah_current']}", 
-            axis=1
-        )
-        
-        # Tampilkan hanya yang berubah
-        changed = merged_status[merged_status['status_wilayah_current'] != merged_status['status_wilayah_compare']]
-        
-        if not changed.empty:
-            st.dataframe(
-                changed.reset_index()[['city', 'Perubahan']],
-                column_config={
-                    "city": "Kota",
-                    "Perubahan": "Perubahan Status"
-                },
-                hide_index=True,
-                height=200
-            )
-        else:
-            st.info("Tidak ada perubahan status antara kedua tanggal.")
-    else:
-        st.info("Pilih tanggal perbandingan untuk melihat perubahan.")
 
 # --- GRAFIK DETAIL FORECASTING ---
 st.markdown("---")
@@ -934,6 +722,6 @@ st.markdown("---")
 st.markdown("""
     <div class='footer'>
         <p>© 2025 Dashboard Kualitas Udara Jawa Timur | Powered by Machine Learning & ARIMA</p>
-        <p style='font-size: 0.8rem; margin-top: 0.5rem;'>Cluster diperbarui berdasarkan tanggal yang dipilih</p>
+        <p style='font-size: 0.8rem; margin-top: 0.5rem;'>Built with Streamlit · Plotly · Scikit-learn · Statsmodels</p>
     </div>
 """, unsafe_allow_html=True)
